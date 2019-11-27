@@ -1,0 +1,233 @@
+# Jupyter Notebook s2i workflow template
+apiVersion: v1
+kind: Template
+metadata:
+  name: jupyter-notebook-s2i-workflow
+  annotations:
+    description: This is Jupyter Notebook s2i Workflow template
+    openshift.io/display-name: "Jupyter Notebook s2i Workflow"
+    version: 0.1.0
+    tags: argo,ai,jupyter,machinelearning,odh,workflows
+    template.openshift.io/documentation-url: https://github.com/cermakm/jupyter-nxflow
+    template.openshift.io/long-description: |-
+      The Workflow builds and executes a given Jupyter Notebook and stores artifacts in s3
+    template.openshift.io/provider-display-name: AICoE @ Red Hat, Inc.
+  labels:
+    app: jupyter-notebook-s2i
+    template: jupyter-notebook-s2i-workflow
+
+parameters:
+  - name: JUPYTER_NOTEBOOK_NAME
+    description: Name of the Jupyter notebook (without .ipynb)
+    displayName: Jupyter Notebook Name
+    required: True
+
+  - name: JUPYTER_NOTEBOOK_CONTENT
+    description: JSON content of the Jupyter Notebook
+    displayName: Jupyter Notebook Content
+    required: True
+
+objects:
+- apiVersion: argoproj.io/v1alpha1
+  kind: Workflow
+  metadata:
+    generateName: jupyter-notebook-s2i-
+    labels:
+      app: jupyter-notebook-s2i
+      component: s2i
+    annotations:
+      # Futures from OpenShift Template parameters
+      jupyter-noteboook/name: "${JUPYTER_NOTEBOOK_NAME}"
+      jupyter-noteboook/json: >-
+        ${JUPYTER_NOTEBOOK_CONTENT}
+  spec:
+    serviceAccountName: argo
+
+    volumes:
+    - name: output-volume
+      emptyDir: {}
+
+    entrypoint: main
+
+    arguments:
+      artifacts:
+      - &notebook-artifact
+        name: notebook
+        raw:
+          data: >-
+            {{workflow.parameters.jupyter-notebook-content}}
+      parameters:
+        # Content of a Jupyter Notebook as JSON
+      - name: jupyter-notebook-content
+        value: "{{workflow.annotations.jupyter-notebook/json}}"
+        # A unique identifier of a Jupyter Notebook (without a suffix)
+      - name: jupyter-notebook-name
+        value: "{{workflow.annotations.jupyter-notebook/name}}"
+        # A target to be run, by default runs all the targets
+      - name: target
+        default: "run"
+
+    templates:
+    - name: main
+      dag:
+        target: "{{workflow.parameters.target}}"
+
+        tasks:
+        - name: configuration
+          template: create-configmap
+        - name: build
+          template: build
+        - name: run
+          dependencies: [configuration, build]
+          template: run
+        - name: run-without-build
+          dependencies: [configuration]
+          template: run
+
+    - name: create-configmap
+      resource:
+        action: apply
+        manifest: |
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: "jupyter-notebook-{{workflow.parameters.jupyter-notebook-name}}"
+            labels:
+              app: jupyter-notebook-s2i
+              component: s2i
+          data:
+            JUPYTER_NOTEBOOK_NAME: "{{workflow.parameters.jupyter-notebook-name}}"
+      serviceAccountName: inspector
+
+
+    - name: build
+      steps:
+      - - name: create-imagestream
+          template: create-imagestream
+      - - name: create-buildconfig
+          template: create-buildconfig
+      - - name: start-build
+          arguments:
+            artifacts:
+            - <<: *notebook-artifact
+          template: start-build
+
+    - name: create-imagestream
+      resource:
+        action: create
+        manifest: |
+          apiVersion: image.openshift.io/v1
+          kind: ImageStream
+          metadata:
+            labels:
+              app: jupyter-notebook-s2i
+              component: s2i
+            name: "jupyter-notebook-{{workflow.parameters.jupyter-notebook-name}}"
+            ownerReferences:
+            - apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              name: "{{workflow.name}}"
+              uid: "{{workflow.uid}}"
+          spec:
+            lookupPolicy:
+              local: true
+
+    - name: create-buildconfig
+      resource:
+        action: create
+        validate: false
+        manifest: |
+          kind: BuildConfig
+          apiVersion: build.openshift.io/v1
+          metadata:
+            labels:
+              app: jupyter-notebook-s2i
+              component: s2i
+            name: "jupyter-notebook-{{workflow.parameters.jupyter-notebook-name}}"
+            ownerReferences:
+            - apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              name: "{{workflow.name}}"
+              uid: "{{workflow.uid}}"
+          spec:
+            output:
+              to:
+                kind: ImageStreamTag
+                name: "jupyter-notebook-{{workflow.parameters.jupyter-notebook-name}}:latest"
+            source:
+              type: Binary
+            strategy:
+              sourceStrategy:
+                env:
+                - name: JUPYTER_NOTEBOOK_PATH
+                  value: "{{workflow.parameters.jupyter-notebook-name}}.ipynb"
+                from:
+                  kind: ImageStreamTag
+                  name: "jupyter-notebook-s2i:latest"
+
+    - name: start-build
+      inputs:
+        artifacts:
+        - name: notebook
+          path: "/mnt/inputs/artifacts/{{workflow.parameters.jupyter-notebook-name}}.ipynb"
+      script:
+        image: "cermakm/oc-tool:latest"
+        command: [sh]
+        source: |
+          set -euo pipefail
+
+          echo "--- Environment:" ; env | sort
+          echo "--- Current working directory: $PWD" ; ls -calh
+
+          notebook_name="$(basename "{{inputs.artifacts.notebook.path}}")"
+
+          echo "--- Notebook content:"
+          cat "{{inputs.artifacts.notebook.path}}" | jq -c | tee "$notebook_name"
+
+          echo "--- Start build"
+          oc start-build \
+            --from-file {{inputs.artifacts.notebook.path}} \
+            --wait \
+            jupyter-notebook-{{workflow.parameters.jupyter-notebook-name}}
+        resources:
+          limits:
+            cpu: 100m
+            memory: 32Mi
+
+
+    - name: run
+      steps: &run-steps
+      - - name: run-notebook
+          arguments:
+            artifacts:
+            - <<: *notebook-artifact
+          template: run-notebook
+
+    - name: run-notebook
+      inputs:
+        artifacts:
+        - name: notebook
+          path: "/mnt/inputs/artifacts/{{workflow.parameters.jupyter-notebook-name}}.ipynb"
+      outputs:
+        artifacts:
+        - name: output
+          path: "/opt/app-root/src"
+          # archive:
+          #   none: {}
+      container:
+        image: "jupyter-notebook-{{workflow.parameters.jupyter-notebook-name}}:latest"
+        imagePullPolicy: IfNotPresent
+        command: [/usr/libexec/s2i/run]
+        env:
+        - name: JUPYTER_NOTEBOOK_PATH
+          value: "{{inputs.artifacts.notebook.path}}"
+        envFrom:
+        - configMapRef:
+            name: "jupyter-notebook-{{workflow.parameters.jupyter-notebook-name}}"
+        volumeMounts:
+        - name: output-volume
+          mountPath: "/opt/app-root/src"
+
+
+    - name: run-without-build
+      steps: *run-steps
