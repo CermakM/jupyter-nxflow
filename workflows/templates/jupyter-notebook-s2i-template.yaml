@@ -1,0 +1,561 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: jupyter-notebook-s2i-template
+  labels:
+    app: jupyter-notebook-s2i
+    component: s2i
+spec:
+  templates:
+  # ----  main  ----
+  - name: main
+    inputs:  &inputs
+      artifacts:
+      - name: notebook
+      parameters:
+      - name: notebook-name
+      - name: pipeline-step
+      - name: volume
+      # Defaults
+      - name: image-name
+        value: "jupyter-notebook-{{inputs.parameters.notebook-name}}"
+    dag:
+      failFast: false
+      tasks:
+      - &requirements
+        name: requirements
+        arguments:
+          artifacts:
+          - name: notebook
+            from: "{{inputs.artifacts.notebook}}"
+          parameters:
+          - name: volume
+            value: "{{inputs.parameters.volume}}"
+        template: requirements
+
+      - &check-requirements
+        name: check-requirements
+        arguments:
+          artifacts:
+          - name: requirements
+            from: "{{tasks.requirements.outputs.artifacts.requirements}}"
+          parameters:
+          - name: notebook-name
+            value: "{{inputs.parameters.notebook-name}}"
+          - name: volume
+            value: "{{inputs.parameters.volume}}"
+        template: check-requirements
+        dependencies: [requirements]
+
+      - &check-imagestream
+        name: check-imagestream
+        arguments:
+          parameters:
+          - name: image-name
+            value: "{{inputs.parameters.image-name}}"
+          - name: volume
+            value: "{{inputs.parameters.volume}}"
+        template: check-imagestream
+        dependencies: [requirements]
+
+      - &check
+        name: check
+        arguments:
+          parameters:
+          - name: check-requirements-status
+            value: "{{tasks.check-requirements.status}}"
+          - name: check-imagestream-status
+            value: "{{tasks.check-imagestream.status}}"
+          - name: volume
+            value: "{{inputs.parameters.volume}}"
+        template: check-result
+        dependencies: [check-requirements, check-imagestream]
+
+      - &configuration
+        name: configuration
+        when: "{{tasks.check.outputs.parameters.skip-build}} == false"
+        arguments:
+          parameters:
+          - name: notebook-name
+            value: "{{inputs.parameters.notebook-name}}"
+          - name: requirements
+            value: "{{tasks.requirements.outputs.parameters.requirements}}"
+        template: configuration
+        dependencies: [check]
+
+      - &build
+        name: build
+        when: "{{tasks.check.outputs.parameters.skip-build}} == false"
+        arguments:
+          artifacts:
+          - name: notebook
+            from: "{{inputs.artifacts.notebook}}"
+          parameters:
+          - name: image-name
+            value: "{{inputs.parameters.image-name}}"
+          - name: notebook-name
+            value: "{{inputs.parameters.notebook-name}}"
+          - name: pipeline-step
+            value: "{{inputs.parameters.pipeline-step}}"
+          - name: volume
+            value: "{{inputs.parameters.volume}}"
+        template: build
+        dependencies: [check]
+
+      - &run
+        name: run
+        when: "{{tasks.check.outputs.parameters.skip-build}} == false"
+        arguments:
+          artifacts:
+          - name: notebook
+            from: "{{inputs.artifacts.notebook}}"
+          parameters:
+          - name: image-name
+            value: "{{inputs.parameters.image-name}}"
+          - name: notebook-name
+            value: "{{inputs.parameters.notebook-name}}"
+          - name: pipeline-step
+            value: "{{inputs.parameters.pipeline-step}}"
+          - name: volume
+            value: "{{inputs.parameters.volume}}"
+        template: run
+        dependencies: [check, build]
+
+      - <<: *run
+        name: run-without-build
+        when: "{{tasks.check.outputs.parameters.skip-build}} == true"
+        dependencies: [check]
+
+
+  # ----  main::build  ----
+  - name: main::build
+    inputs: *inputs
+    dag:
+      failFast: false
+      tasks:
+      - *requirements
+      - *check-requirements
+      - *check-imagestream
+      - *check
+      - *configuration
+      - *build
+
+  # ----  main::run  ---
+  - name: main::run
+    inputs: *inputs
+    dag:
+      failFast: true
+      tasks:
+      - name: run
+        arguments:
+          artifacts:
+          - name: notebook
+            from: "{{inputs.artifacts.notebook}}"
+          parameters:
+          - name: image-name
+            value: "{{inputs.parameters.image-name}}"
+          - name: notebook-name
+            value: "{{inputs.parameters.notebook-name}}"
+          - name: pipeline-step
+            value: "{{inputs.parameters.pipeline-step}}"
+          - name: volume
+            value: "{{inputs.parameters.volume}}"
+        template: run
+
+  # --- templates ---
+
+  - name: requirements
+    inputs:
+      artifacts:
+      - name: notebook
+        path: /mnt/inputs/artifacts/notebook
+      parameters:
+      - name: volume
+    outputs:
+      artifacts:
+      - name: requirements
+        path: /mnt/outputs/artifacts/requirements
+      parameters:
+      - name: requirements
+        valueFrom:
+          path: "{{outputs.artifacts.requirements.path}}"
+    retryStrategy:
+      backoff:
+        duration: 1
+        maxDuration: 180
+    script:
+      image: "jupyter-notebook-s2i:latest"
+      command:
+      - "/bin/bash"
+      source: |
+        source /usr/libexec/s2i-lib/main
+
+        requirements="$( notebook::requirements::get {{inputs.artifacts.notebook.path}} )"
+        if ( [ -z "$requirements" ] ); then
+          # make requirements consistent if not provided
+          requirements="null"
+        fi
+
+        echo "$requirements" | tee {{outputs.artifacts.requirements.path}}
+
+      volumeMounts:
+      - name: "{{inputs.parameters.volume}}"
+        mountPath: "/mnt/outputs/artifacts"
+      resources:
+        limits:
+          cpu: 100m
+          memory: 64Mi
+    metadata:
+      annotations:
+        alpha.image.policy.openshift.io/resolve-names: '*'
+
+
+  - name: check-requirements
+    inputs:
+      artifacts:
+      - name: requirements
+        path: /mnt/inputs/artifacts/requirements
+      parameters:
+      - name: notebook-name
+      - name: volume
+    outputs:
+      parameters:
+      - name: skip-build
+        valueFrom:
+          path: "/mnt/outputs/parameters/status"
+    retryStrategy:
+      backoff:
+        duration: 1
+        maxDuration: 30
+      retryPolicy: OnError
+    script:
+      image: "cermakm/kubectl:latest"
+      command:
+      - "sh"
+      source: |
+        set -eux
+
+        requirements="$( cat "{{inputs.artifacts.requirements.path}}" )"
+        {
+          cached_requirements=$(\
+            kubectl get configmap "jupyter-notebook-{{inputs.parameters.notebook-name}}" -o json |\
+            jq -r '.data.requirements' \
+          )
+
+          if ( [ -z "$requirements" ] || [ "$requirements" == "null" ] ) && \
+            ( [ -z "$cached_requirements" ] || [ "$cached_requirements" == "null" ] )
+          then
+            return 0
+          fi
+
+          echo "$requirements"        > /tmp/requirements
+          echo "$cached_requirements" > /tmp/cached_requirements
+
+          diff -s \
+            --ignore-all-space     \
+            --ignore-blank-lines   \
+            --ignore-space-change  \
+            --ignore-tab-expansion \
+            --report-identical-files /tmp/requirements /tmp/cached_requirements
+
+          return $?
+        } && echo "0" > /mnt/outputs/parameters/status \
+          || echo "1" > /mnt/outputs/parameters/status
+
+        exit 0
+      volumeMounts:
+      - name: "{{inputs.parameters.volume}}"
+        mountPath: "/mnt/outputs/parameters"
+      resources:
+        limits:
+          cpu: 100m
+          memory: 64Mi
+
+  - name: check-imagestream
+    inputs:
+      parameters:
+      - name: image-name
+      - name: volume
+    outputs:
+      parameters:
+      - name: skip-build
+        valueFrom:
+          path: "/mnt/outputs/parameters/status"
+    retryStrategy:
+      backoff:
+        duration: 1
+        maxDuration: 30
+      retryPolicy: OnError
+    script:
+      image: "cermakm/kubectl:latest"
+      command:
+      - "sh"
+      source: |
+        set -eux
+
+        {
+          nof_tags=$(\
+            kubectl get imagestream "{{inputs.parameters.image-name}}" -o json |\
+              jq -r '.status.tags[].items' |\
+              jq length \
+          )
+          [ "$nof_tags" == "0" ] && \
+            >&2 echo "Could NOT find any images for {{inputs.parameters.image-name}}." ; return 1
+        } && echo "0" > /mnt/outputs/parameters/status \
+          || echo "1" > /mnt/outputs/parameters/status
+
+        exit 0
+      volumeMounts:
+      - name: "{{inputs.parameters.volume}}"
+        mountPath: "/mnt/outputs/parameters"
+      resources:
+        limits:
+          cpu: 100m
+          memory: 64Mi
+
+  - name: check-result
+    inputs:
+      parameters:
+      - name: check-requirements-status
+      - name: check-imagestream-status
+      - name: volume
+    outputs:
+      parameters:
+      - name: skip-build
+        valueFrom:
+          path: "/mnt/outputs/parameters/skip-build"
+    retryStrategy:
+      backoff:
+        duration: 1
+        maxDuration: 30
+      retryPolicy: OnError
+    script:
+      image: "cermakm/kubectl:latest"
+      command:
+      - "sh"
+      source: |
+        set -euxo pipefail
+
+        if [ "{{inputs.parameters.check-requirements-status}}" == "Succeeded" ] && \
+           [ "{{inputs.parameters.check-imagestream-status}}"  == "Succeeded" ];
+        then
+          echo "true"  > /mnt/outputs/parameters/skip-build
+        else
+          echo "false" > /mnt/outputs/parameters/skip-build
+        fi
+      volumeMounts:
+      - name: "{{inputs.parameters.volume}}"
+        mountPath: "/mnt/outputs/parameters"
+      resources:
+        limits:
+          cpu: 100m
+          memory: 64Mi
+
+  - name: configuration  # parent: main
+    inputs:
+      parameters:
+      - name: notebook-name
+      - name: requirements
+    resource:
+      action: apply
+      manifest: |
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: "jupyter-notebook-{{inputs.parameters.notebook-name}}"
+          labels:
+            app: jupyter-notebook-s2i
+            component: s2i
+        data:
+          name: "{{inputs.parameters.notebook-name}}"
+          requirements: >-
+            {{inputs.parameters.requirements}}
+
+
+  - name: build  # parent: main
+    inputs:
+      artifacts:
+      - name: notebook
+      parameters:
+      - name: image-name
+      - name: notebook-name
+    steps:
+    - - name: create-imagestream
+        arguments:
+          parameters:
+          - name: image-name
+            value: "{{inputs.parameters.image-name}}"
+        template: create-imagestream
+    - - name: create-buildconfig
+        arguments:
+          parameters:
+          - name: image-name
+            value: "{{inputs.parameters.image-name}}"
+          - name: notebook-name
+            value: "{{inputs.parameters.notebook-name}}"
+        template: create-buildconfig
+    - - name: start-build
+        arguments:
+          artifacts:
+          - name: notebook
+            from: "{{inputs.artifacts.notebook}}"
+          parameters:
+          - name: notebook-name
+            value: "{{inputs.parameters.notebook-name}}"
+        template: start-build
+
+  - name: create-imagestream
+    inputs:
+      parameters:
+      - name: image-name
+    resource:
+      action: apply
+      manifest: |
+        kind: ImageStream
+        apiVersion: image.openshift.io/v1
+        metadata:
+          annotations:
+            workflows.argoproj.io/workflow: "{{workflow.name}}"
+          labels:
+            app: jupyter-notebook-s2i
+            component: s2i
+          name: "{{inputs.parameters.image-name}}"
+        spec:
+          lookupPolicy:
+            local: true
+
+  - name: create-buildconfig
+    inputs:
+      parameters:
+      - name: image-name
+      - name: notebook-name
+    resource:
+      action: apply
+      validate: false
+      manifest: |
+        kind: BuildConfig
+        apiVersion: build.openshift.io/v1
+        metadata:
+          annotations:
+            workflows.argoproj.io/workflow: "{{workflow.name}}"
+          labels:
+            app: jupyter-notebook-s2i
+            component: s2i
+          name: "jupyter-notebook-{{inputs.parameters.notebook-name}}"
+        spec:
+          output:
+            to:
+              kind: ImageStreamTag
+              name: "{{inputs.parameters.image-name}}:latest"
+          source:
+            type: Binary
+          strategy:
+            sourceStrategy:
+              env:
+              - name: JUPYTER_NOTEBOOK_PATH
+                value: "{{inputs.parameters.notebook-name}}.ipynb"
+              from:
+                kind: ImageStreamTag
+                name: "jupyter-notebook-s2i:latest"
+
+  - name: start-build
+    inputs:
+      artifacts:
+      - name: notebook
+        path: "/mnt/inputs/artifacts/{{inputs.parameters.notebook-name}}.ipynb"
+      parameters:
+      - name: notebook-name
+    retryStrategy:
+      backoff:
+        duration: 1
+      retryPolicy: OnError
+    script:
+      image: "cermakm/oc-tool:latest"
+      imagePullPolicy: IfNotPresent
+      command:
+      - "sh"
+      source: |
+        set -euo pipefail
+
+        echo "--- Environment:" ; env | sort
+        echo "--- Current working directory: $PWD" ; ls -calh
+
+        notebook_name="$(basename "{{inputs.artifacts.notebook.path}}")"
+
+        echo "--- Notebook content:"
+        cat "{{inputs.artifacts.notebook.path}}" | jq -c | tee "$notebook_name"
+
+        echo "--- Start build"
+        oc start-build \
+          --from-file {{inputs.artifacts.notebook.path}} \
+          --wait \
+          jupyter-notebook-{{inputs.parameters.notebook-name}}
+
+        exit $?
+      resources:
+        limits:
+          cpu: 100m
+          memory: 32Mi
+
+
+  - name: run  # parent: main
+    inputs:
+      artifacts:
+      - name: notebook
+      parameters:
+      - name: image-name
+      - name: notebook-name
+      - name: pipeline-step
+      - name: volume
+    steps: &run-steps
+    - - name: run-notebook
+        arguments:
+          artifacts:
+          - name: notebook
+            from: "{{inputs.artifacts.notebook}}"
+          parameters:
+          - name: image-name
+            value: "{{inputs.parameters.image-name}}"
+          - name: notebook-name
+            value: "{{inputs.parameters.notebook-name}}"
+          - name: pipeline-step
+            value: "{{inputs.parameters.pipeline-step}}"
+          - name: volume
+            value: "{{inputs.parameters.volume}}"
+        template: run-notebook
+
+  - name: run-notebook
+    inputs:
+      artifacts:
+      - name: notebook
+        path: "/mnt/inputs/artifacts/{{inputs.parameters.notebook-name}}.ipynb"
+      parameters:
+      - name: image-name
+      - name: notebook-name
+      - name: pipeline-step
+      - name: volume
+    outputs:
+      artifacts:
+      - name: output
+        path: "/opt/app-root/src"
+    retryStrategy:
+      backoff:
+        duration: 1
+      retryPolicy: OnError
+    container:
+      image: "{{inputs.parameters.image-name}}:latest"
+      imagePullPolicy: IfNotPresent
+      command: [/usr/libexec/s2i/run]
+      env:
+      - name: JUPYTER_NOTEBOOK_PATH
+        value: "{{inputs.artifacts.notebook.path}}"
+      volumeMounts:
+      - name: "{{inputs.parameters.volume}}"
+        mountPath: "/opt/app-root/src"
+      resources:
+        limits:
+          cpu: 1
+          memory: 1Gi
+    metadata:
+      annotations:
+        "pipelines.kubeflow.org/pipeline_step": "{{inputs.parameters.pipeline-step}}"
